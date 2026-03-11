@@ -7,6 +7,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.io.File;
+import java.nio.file.Paths;
 
 @Configuration
 public class VectorStoreConfig {
@@ -17,7 +18,7 @@ public class VectorStoreConfig {
     @Bean
     public SimpleVectorStore vectorStore(EmbeddingModel embeddingModel) {
         SimpleVectorStore store = SimpleVectorStore.builder(embeddingModel).build();
-        File file = new File(vectorStorePath);
+        File file = Paths.get(System.getProperty("user.dir")).resolve(vectorStorePath).normalize().toFile();
         if (file.exists()) {
             store.load(file);
         }

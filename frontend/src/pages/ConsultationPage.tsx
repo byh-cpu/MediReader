@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from 'react';
-import { Card, Button, message, Alert, Divider } from 'antd';
-import { ClearOutlined, FileTextOutlined } from '@ant-design/icons';
+import { Button, message, Alert, Divider, Image, Space, Tag } from 'antd';
+import { ClearOutlined, FileTextOutlined, PictureOutlined, FilePdfOutlined } from '@ant-design/icons';
 import PdfUploader from '../components/PdfUploader';
 import WorkflowSteps from '../components/WorkflowSteps';
 import StreamingAnswer from '../components/StreamingAnswer';
@@ -14,6 +14,8 @@ interface Source {
   source: string;
 }
 
+const isImageFile = (file: File) => file.type.startsWith('image/');
+
 const ConsultationPage: React.FC = () => {
   const [analyzing, setAnalyzing] = useState(false);
   const [currentStep, setCurrentStep] = useState(-1);
@@ -23,7 +25,9 @@ const ConsultationPage: React.FC = () => {
   const [streamingText, setStreamingText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [completed, setCompleted] = useState(false);
-  const [fileName, setFileName] = useState('');
+  const [stepMessages, setStepMessages] = useState<Record<string, string>>({});
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [previewUrls, setPreviewUrls] = useState<string[]>([]);
   const ctrlRef = useRef<AbortController | null>(null);
 
   const reset = useCallback(() => {
@@ -34,13 +38,16 @@ const ConsultationPage: React.FC = () => {
     setAnalyzing(false);
     setCurrentStep(-1);
     setStepStatuses({});
+    setStepMessages({});
     setPatientSummary('');
     setSources([]);
     setStreamingText('');
     setIsStreaming(false);
     setCompleted(false);
-    setFileName('');
-  }, []);
+    setSelectedFiles([]);
+    previewUrls.forEach((url) => URL.revokeObjectURL(url));
+    setPreviewUrls([]);
+  }, [previewUrls]);
 
   const handleEvent = useCallback((event: WorkflowEvent) => {
     const stepIndex = STEP_ORDER.indexOf(event.step);
@@ -49,6 +56,9 @@ const ConsultationPage: React.FC = () => {
       case 'running':
         setCurrentStep(stepIndex);
         setStepStatuses((prev) => ({ ...prev, [event.step]: 'running' }));
+        if (event.message) {
+          setStepMessages((prev) => ({ ...prev, [event.step]: event.message! }));
+        }
         if (event.step === 'LLM_ANALYSIS') {
           setIsStreaming(true);
         }
@@ -84,14 +94,18 @@ const ConsultationPage: React.FC = () => {
     }
   }, []);
 
-  const handleFileSelected = (file: File) => {
+  const startAnalysis = (files: File[]) => {
+    if (files.length === 0) return;
     reset();
-    setFileName(file.name);
+
+    const urls = files.filter(isImageFile).map((f) => URL.createObjectURL(f));
+    setPreviewUrls(urls);
+    setSelectedFiles(files);
     setAnalyzing(true);
     setCurrentStep(0);
 
     ctrlRef.current = analyzeConsultation(
-      file,
+      files,
       handleEvent,
       () => {
         message.error('连接异常，请检查后端服务是否正常运行');
@@ -105,13 +119,17 @@ const ConsultationPage: React.FC = () => {
     );
   };
 
+  const handleFileSelected = (file: File) => {
+    startAnalysis([file]);
+  };
+
   const hasStarted = currentStep >= 0;
 
   return (
     <div>
       <Alert
         message="使用说明"
-        description="请先在「知识库管理」页面上传医学指南或药品说明书，然后在此页面上传患者诊断书或病历 PDF，系统将自动分析并给出用药建议。"
+        description="请先在「知识库管理」页面上传医学指南或药品说明书，然后在此页面上传患者诊断书或病历（支持 PDF 和图片），系统将自动分析并给出用药建议。"
         type="info"
         showIcon
         closable
@@ -122,20 +140,42 @@ const ConsultationPage: React.FC = () => {
         <PdfUploader
           onFileSelected={handleFileSelected}
           disabled={analyzing}
-          hint="上传患者诊断书或病历 PDF，系统将自动提取信息并生成用药建议"
+          acceptImages
+          hint="上传患者诊断书、病历 PDF 或检查报告照片，系统将自动识别并生成用药建议"
         />
       </div>
 
       {hasStarted && (
         <>
-          {fileName && (
-            <div style={{ marginBottom: 16, color: '#666' }}>
-              <FileTextOutlined style={{ marginRight: 8 }} />
-              正在分析: <strong>{fileName}</strong>
+          {selectedFiles.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              <Space wrap>
+                {selectedFiles.map((f, i) => (
+                  <Tag
+                    key={i}
+                    icon={isImageFile(f) ? <PictureOutlined /> : <FilePdfOutlined />}
+                    color={isImageFile(f) ? 'orange' : 'blue'}
+                  >
+                    {f.name}
+                  </Tag>
+                ))}
+              </Space>
             </div>
           )}
 
-          <WorkflowSteps currentStep={currentStep} stepStatuses={stepStatuses} />
+          {previewUrls.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              <Image.PreviewGroup>
+                <Space wrap>
+                  {previewUrls.map((url, i) => (
+                    <Image key={i} src={url} height={120} style={{ borderRadius: 8 }} />
+                  ))}
+                </Space>
+              </Image.PreviewGroup>
+            </div>
+          )}
+
+          <WorkflowSteps currentStep={currentStep} stepStatuses={stepStatuses} stepMessages={stepMessages} />
 
           <Divider />
 
@@ -156,7 +196,7 @@ const ConsultationPage: React.FC = () => {
       {!hasStarted && (
         <div className="empty-state">
           <FileTextOutlined />
-          <p>上传诊断书或病历开始智能用药咨询</p>
+          <p>上传诊断书、病历或检查报告照片开始智能用药咨询</p>
         </div>
       )}
     </div>

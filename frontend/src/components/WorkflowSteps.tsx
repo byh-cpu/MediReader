@@ -9,6 +9,7 @@ import {
 interface WorkflowStepsProps {
   currentStep: number;
   stepStatuses: Record<string, string>;
+  stepMessages?: Record<string, string>;
 }
 
 const STEPS = [
@@ -18,7 +19,7 @@ const STEPS = [
   { key: 'LLM_ANALYSIS', title: '用药分析', icon: <MedicineBoxOutlined /> },
 ];
 
-const WorkflowSteps: React.FC<WorkflowStepsProps> = ({ currentStep, stepStatuses }) => {
+const WorkflowSteps: React.FC<WorkflowStepsProps> = ({ currentStep, stepStatuses, stepMessages }) => {
   const mapStatus = (key: string, index: number): 'wait' | 'process' | 'finish' | 'error' => {
     const s = stepStatuses[key];
     if (s === 'finish' || s === 'done') return 'finish';
@@ -34,6 +35,7 @@ const WorkflowSteps: React.FC<WorkflowStepsProps> = ({ currentStep, stepStatuses
         current={currentStep}
         items={STEPS.map((step, index) => ({
           title: step.title,
+          description: stepStatuses[step.key] === 'running' ? stepMessages?.[step.key] : undefined,
           icon: step.icon,
           status: mapStatus(step.key, index),
         }))}

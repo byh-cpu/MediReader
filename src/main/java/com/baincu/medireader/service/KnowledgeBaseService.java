@@ -17,6 +17,8 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -29,6 +31,10 @@ public class KnowledgeBaseService {
     private final PdfParserService pdfParserService;
     private final SimpleVectorStore vectorStore;
     private final ObjectMapper objectMapper;
+
+    private File knowledgeDirFile;
+    private File vectorStoreFile;
+    private File metadataFile;
 
     @Value("${medireader.knowledge-dir}")
     private String knowledgeDir;
@@ -48,33 +54,53 @@ public class KnowledgeBaseService {
 
     @PostConstruct
     public void init() {
-        new File(knowledgeDir).mkdirs();
+        Path base = Paths.get(System.getProperty("user.dir"));
+        this.knowledgeDirFile = base.resolve(knowledgeDir).normalize().toFile();
+        this.vectorStoreFile = base.resolve(vectorStorePath).normalize().toFile();
+        this.metadataFile = base.resolve(metadataPath).normalize().toFile();
+
+        knowledgeDirFile.mkdirs();
+        vectorStoreFile.getParentFile().mkdirs();
+        log.info("Knowledge dir: {}", knowledgeDirFile.getAbsolutePath());
     }
 
     public KnowledgeUploadResponse uploadDocument(MultipartFile file) throws IOException {
         String docId = UUID.randomUUID().toString();
 
-        File savedFile = new File(knowledgeDir, docId + ".pdf");
-        file.transferTo(savedFile);
+        File savedFile = new File(knowledgeDirFile, docId + ".pdf");
+        file.transferTo(savedFile.getAbsoluteFile());
 
         Resource resource = new FileSystemResource(savedFile);
         List<Document> chunks = pdfParserService.parsePdfAndSplit(resource);
 
-        List<String> chunkIds = new ArrayList<>();
         for (Document chunk : chunks) {
             chunk.getMetadata().put("documentId", docId);
             chunk.getMetadata().put("source", file.getOriginalFilename());
-            chunkIds.add(chunk.getId());
         }
 
-        vectorStore.add(chunks);
-        vectorStore.save(new File(vectorStorePath));
+        List<String> chunkIds = new ArrayList<>();
+        int failed = 0;
+        for (Document chunk : chunks) {
+            try {
+                vectorStore.add(List.of(chunk));
+                chunkIds.add(chunk.getId());
+            } catch (Exception e) {
+                failed++;
+                log.warn("Skipping chunk {} (embedding failed): {}", chunk.getId(),
+                        e.getMessage().length() > 100 ? e.getMessage().substring(0, 100) : e.getMessage());
+            }
+        }
+        if (chunkIds.isEmpty()) {
+            throw new IOException("所有文本块嵌入均失败，请检查 PDF 内容或 Ollama 嵌入模型状态");
+        }
+        vectorStore.save(vectorStoreFile);
+        log.info("Embedded {}/{} chunks ({} failed)", chunkIds.size(), chunks.size(), failed);
 
         KnowledgeDocumentInfo info = KnowledgeDocumentInfo.builder()
                 .id(docId)
                 .fileName(file.getOriginalFilename())
                 .fileSize(file.getSize())
-                .chunkCount(chunks.size())
+                .chunkCount(chunkIds.size())
                 .chunkIds(chunkIds)
                 .uploadTime(LocalDateTime.now())
                 .build();
@@ -103,10 +129,10 @@ public class KnowledgeBaseService {
 
         if (doc.getChunkIds() != null && !doc.getChunkIds().isEmpty()) {
             vectorStore.delete(doc.getChunkIds());
-            vectorStore.save(new File(vectorStorePath));
+            vectorStore.save(vectorStoreFile);
         }
 
-        new File(knowledgeDir, id + ".pdf").delete();
+        new File(knowledgeDirFile, id + ".pdf").delete();
 
         docs.removeIf(d -> d.getId().equals(id));
         saveAllMetadata(docs);
@@ -121,12 +147,11 @@ public class KnowledgeBaseService {
     }
 
     private List<KnowledgeDocumentInfo> loadAllMetadata() {
-        File file = new File(metadataPath);
-        if (!file.exists()) {
+        if (!metadataFile.exists()) {
             return new ArrayList<>();
         }
         try {
-            return objectMapper.readValue(file, new TypeReference<List<KnowledgeDocumentInfo>>() {});
+            return objectMapper.readValue(metadataFile, new TypeReference<List<KnowledgeDocumentInfo>>() {});
         } catch (IOException e) {
             log.error("Failed to load metadata", e);
             return new ArrayList<>();
@@ -135,9 +160,8 @@ public class KnowledgeBaseService {
 
     private void saveAllMetadata(List<KnowledgeDocumentInfo> docs) {
         try {
-            File file = new File(metadataPath);
-            file.getParentFile().mkdirs();
-            objectMapper.writerWithDefaultPrettyPrinter().writeValue(file, docs);
+            metadataFile.getParentFile().mkdirs();
+            objectMapper.writerWithDefaultPrettyPrinter().writeValue(metadataFile, docs);
         } catch (IOException e) {
             log.error("Failed to save metadata", e);
         }

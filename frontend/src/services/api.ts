@@ -56,13 +56,16 @@ export const deleteKnowledge = async (id: string): Promise<void> => {
 };
 
 export const analyzeConsultation = (
-  file: File,
+  files: File | File[],
   onEvent: (event: WorkflowEvent) => void,
   onError?: (error: unknown) => void,
   onComplete?: () => void,
 ): AbortController => {
   const formData = new FormData();
-  formData.append('file', file);
+  const fileList = Array.isArray(files) ? files : [files];
+  for (const f of fileList) {
+    formData.append('files', f);
+  }
 
   const ctrl = new AbortController();
 
