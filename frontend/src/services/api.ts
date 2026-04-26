@@ -25,6 +25,55 @@ export interface UploadResponse {
   message: string;
 }
 
+export interface SourceItem {
+  content: string;
+  source: string;
+  sectionTitle?: string;
+  page?: string;
+}
+
+export interface BasicInfo {
+  name?: string;
+  age?: string;
+  gender?: string;
+  weight?: string;
+  hospital?: string;
+  department?: string;
+}
+
+export interface LabResult {
+  item?: string;
+  value?: string;
+  referenceRange?: string;
+  unit?: string;
+  flag?: string;
+}
+
+export interface StructuredInfo {
+  basicInfo?: BasicInfo;
+  chiefComplaints?: string[];
+  diagnoses?: string[];
+  currentMedications?: string[];
+  allergies?: string[];
+  pastMedicalHistory?: string[];
+  labResults?: LabResult[];
+  riskFactors?: string[];
+  uncertainties?: string[];
+  evidence?: string[];
+}
+
+export interface EvaluationMetrics {
+  inputFileCount: number;
+  parsedTextLength: number;
+  retrievedDocumentCount: number;
+  extractedDiagnosisCount: number;
+  extractedLabResultCount: number;
+  uncertaintyCount: number;
+  parseCostMs: number;
+  extractCostMs: number;
+  retrievalCostMs: number;
+}
+
 export const uploadKnowledge = async (file: File): Promise<UploadResponse> => {
   const formData = new FormData();
   formData.append('file', file);

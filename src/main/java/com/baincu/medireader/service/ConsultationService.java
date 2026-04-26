@@ -1,7 +1,11 @@
 package com.baincu.medireader.service;
 
+import com.baincu.medireader.model.dto.EvaluationMetrics;
+import com.baincu.medireader.model.dto.PatientStructuredInfo;
 import com.baincu.medireader.model.dto.WorkflowStepEvent;
 import com.baincu.medireader.model.enums.WorkflowStep;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
@@ -25,7 +29,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -38,6 +46,8 @@ public class ConsultationService {
     private final ChatClient.Builder chatClientBuilder;
     private final PromptService promptService;
     private final OcrService ocrService;
+    private final PatientStructuredExtractionService structuredExtractionService;
+    private final ObjectMapper objectMapper;
 
     @Value("${medireader.vision-model:minicpm-v}")
     private String visionModel;
@@ -46,12 +56,15 @@ public class ConsultationService {
                                SimpleVectorStore vectorStore,
                                ChatClient.Builder chatClientBuilder,
                                PromptService promptService,
-                               OcrService ocrService) {
+                               OcrService ocrService,
+                               PatientStructuredExtractionService structuredExtractionService) {
         this.pdfParserService = pdfParserService;
         this.vectorStore = vectorStore;
         this.chatClientBuilder = chatClientBuilder;
         this.promptService = promptService;
         this.ocrService = ocrService;
+        this.structuredExtractionService = structuredExtractionService;
+        this.objectMapper = new ObjectMapper();
     }
 
     public record UploadedFile(byte[] data, String fileName, String type, String contentType) {}
@@ -62,12 +75,14 @@ public class ConsultationService {
         emitter.onError(e -> emitterDead.set(true));
         emitter.onCompletion(() -> emitterDead.set(true));
 
+        long parseStart = System.currentTimeMillis();
+        int textLength;
+
         try {
-            // Step 1: Parse files
             sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                     .step(WorkflowStep.PDF_PARSING)
                     .status("running")
-                    .message("正在解析上传的文件...")
+                    .message("Parsing uploaded files...")
                     .build());
 
             List<String> textParts = new ArrayList<>();
@@ -82,15 +97,21 @@ public class ConsultationService {
                 if ("pdf".equals(file.type())) {
                     Resource resource = new ByteArrayResource(file.data()) {
                         @Override
-                        public String getFilename() { return file.fileName(); }
+                        public String getFilename() {
+                            return file.fileName();
+                        }
                     };
                     String text = pdfParserService.extractFullText(resource);
                     textParts.add(text);
                     log.info("Parsed PDF: {} ({} chars)", file.fileName(), text.length());
                 } else if ("image".equals(file.type())) {
-                    String text = executeWithHeartbeat(emitter, emitterDead, WorkflowStep.PDF_PARSING,
-                            "正在识别图片 [" + file.fileName() + "]（OCR + 视觉模型）",
-                            () -> extractTextFromImage(file.data(), file.contentType(), file.fileName()));
+                    String text = executeWithHeartbeat(
+                            emitter,
+                            emitterDead,
+                            WorkflowStep.PDF_PARSING,
+                            "Recognizing image [" + file.fileName() + "] with OCR and vision model",
+                            () -> extractTextFromImage(file.data(), file.fileName())
+                    );
                     textParts.add(text);
                     log.info("Recognized image: {} ({} chars)", file.fileName(), text.length());
                 }
@@ -102,26 +123,31 @@ public class ConsultationService {
             }
 
             String diagnosisText = String.join("\n\n", textParts);
+            textLength = diagnosisText.length();
+            long parseCostMs = System.currentTimeMillis() - parseStart;
 
             sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                     .step(WorkflowStep.PDF_PARSING)
                     .status("done")
-                    .message("文件解析完成 (" + fileNames.size() + " 个文件)")
+                    .message("File parsing completed (" + fileNames.size() + " files)")
                     .data(Map.of(
-                            "textLength", diagnosisText.length(),
+                            "textLength", textLength,
                             "preview", truncate(diagnosisText, 300),
-                            "files", fileNames
+                            "files", fileNames,
+                            "parseCostMs", parseCostMs
                     ))
                     .build());
 
-            // Step 2: Extract patient info via LLM
             sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                     .step(WorkflowStep.INFO_EXTRACTION)
                     .status("running")
-                    .message("正在提取患者关键信息...")
+                    .message("Extracting structured patient information...")
                     .build());
 
-            String patientSummary = extractPatientInfo(diagnosisText);
+            long extractStart = System.currentTimeMillis();
+            PatientStructuredInfo patientInfo = extractPatientInfo(diagnosisText);
+            String patientSummary = toJson(patientInfo);
+            long extractCostMs = System.currentTimeMillis() - extractStart;
 
             if (emitterDead.get()) {
                 log.warn("Emitter closed after info extraction, aborting workflow");
@@ -131,30 +157,41 @@ public class ConsultationService {
             sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                     .step(WorkflowStep.INFO_EXTRACTION)
                     .status("done")
-                    .message("患者信息提取完成")
-                    .data(Map.of("patientSummary", patientSummary))
+                    .message("Patient information extraction completed")
+                    .data(Map.of(
+                            "patientSummary", patientSummary,
+                            "structuredInfo", patientInfo,
+                            "extractCostMs", extractCostMs
+                    ))
                     .build());
 
-            // Step 3: RAG Retrieval
             sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                     .step(WorkflowStep.RAG_RETRIEVAL)
                     .status("running")
-                    .message("正在检索相关医学知识...")
+                    .message("Retrieving relevant medical knowledge...")
                     .build());
 
-            List<Document> relevantDocs = searchRelevantDocuments(patientSummary);
+            long retrievalStart = System.currentTimeMillis();
+            List<Document> relevantDocs = searchRelevantDocuments(patientInfo);
+            long retrievalCostMs = System.currentTimeMillis() - retrievalStart;
             List<Map<String, String>> sources = relevantDocs.stream()
                     .map(doc -> Map.of(
                             "content", truncate(doc.getText() != null ? doc.getText() : "", 200),
-                            "source", String.valueOf(doc.getMetadata().getOrDefault("source", "未知"))
+                            "source", String.valueOf(doc.getMetadata().getOrDefault("source", "unknown")),
+                            "sectionTitle", String.valueOf(doc.getMetadata().getOrDefault("sectionTitle", "unknown section")),
+                            "page", String.valueOf(doc.getMetadata().getOrDefault("page", "unknown page"))
                     ))
                     .toList();
 
             sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                     .step(WorkflowStep.RAG_RETRIEVAL)
                     .status("done")
-                    .message("检索到 " + relevantDocs.size() + " 条相关医学知识")
-                    .data(Map.of("sources", sources, "count", relevantDocs.size()))
+                    .message("Retrieved " + relevantDocs.size() + " relevant medical references")
+                    .data(Map.of(
+                            "sources", sources,
+                            "count", relevantDocs.size(),
+                            "retrievalCostMs", retrievalCostMs
+                    ))
                     .build());
 
             if (emitterDead.get()) {
@@ -162,52 +199,63 @@ public class ConsultationService {
                 return;
             }
 
-            // Step 4: LLM Streaming Analysis
+            EvaluationMetrics metrics = EvaluationMetrics.builder()
+                    .inputFileCount(files.size())
+                    .parsedTextLength(textLength)
+                    .retrievedDocumentCount(relevantDocs.size())
+                    .extractedDiagnosisCount(patientInfo.getDiagnoses().size())
+                    .extractedLabResultCount(patientInfo.getLabResults().size())
+                    .uncertaintyCount(patientInfo.getUncertainties().size())
+                    .parseCostMs(parseCostMs)
+                    .extractCostMs(extractCostMs)
+                    .retrievalCostMs(retrievalCostMs)
+                    .build();
+
             sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                     .step(WorkflowStep.LLM_ANALYSIS)
                     .status("running")
-                    .message("正在生成用药建议...")
+                    .message("Generating medication advice...")
+                    .data(Map.of("evaluationMetrics", metrics))
                     .build());
 
             streamMedicationAnalysis(patientSummary, relevantDocs, emitter, emitterDead);
-
         } catch (Exception e) {
             log.error("Consultation analysis failed", e);
             if (!emitterDead.get()) {
                 sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                         .step(WorkflowStep.LLM_ANALYSIS)
                         .status("error")
-                        .message("分析失败: " + e.getMessage())
+                        .message("Analysis failed: " + e.getMessage())
                         .build());
-                try { emitter.completeWithError(e); } catch (Exception ignored) {}
+                try {
+                    emitter.completeWithError(e);
+                } catch (Exception ignored) {
+                }
             }
         }
     }
 
-    private String extractTextFromImage(byte[] imageData, String contentType, String fileName) {
+    private String extractTextFromImage(byte[] imageData, String fileName) {
         StringBuilder combined = new StringBuilder();
-
-        // Phase 1: Tesseract OCR (fast, good for printed text)
         String ocrText = "";
         if (ocrService.isAvailable()) {
             log.info("Running Tesseract OCR on: {}", fileName);
             ocrText = ocrService.extractText(imageData, fileName);
             if (!ocrText.isBlank()) {
-                combined.append("【OCR识别结果】\n").append(ocrText).append("\n\n");
+                combined.append("[OCR_RESULT]\n").append(ocrText).append("\n\n");
             }
         }
 
-        // Phase 2: Vision model (good for understanding layout and handwriting)
         log.info("Recognizing image with vision model [{}]: {}", visionModel, fileName);
         byte[] jpegData = convertToJpeg(imageData, fileName);
         String visionText = callVisionModel(jpegData, fileName, ocrText);
         if (!visionText.isBlank()) {
-            combined.append("【视觉模型识别结果】\n").append(visionText);
+            combined.append("[VISION_MODEL_RESULT]\n").append(visionText);
         }
 
         String result = combined.toString().trim();
         if (result.isEmpty()) {
-            throw new RuntimeException("图片识别失败：OCR 和视觉模型均未能提取到有效文字");
+            throw new RuntimeException("Image recognition failed: OCR and vision model extracted no valid text");
         }
         return result;
     }
@@ -215,12 +263,14 @@ public class ConsultationService {
     private String callVisionModel(byte[] jpegData, String fileName, String ocrReference) {
         Resource imageResource = new ByteArrayResource(jpegData) {
             @Override
-            public String getFilename() { return fileName.replaceAll("\\.[^.]+$", ".jpg"); }
+            public String getFilename() {
+                return fileName.replaceAll("\\.[^.]+$", ".jpg");
+            }
         };
 
         String userText = ocrReference.isBlank()
-                ? "请仔细识别这张医疗文档图片中的所有文字内容。包括表格中的每一行数据。如果是手写文字，请尽量辨认但对不确定的标注[不确定]。"
-                : "OCR已初步识别出以下文字，请对照图片内容进行校正和补充，特别注意表格中的数值数据：\n" + truncate(ocrReference, 3000);
+                ? "Please carefully extract all text from this medical document image, including every row in tables. For uncertain handwriting, mark it as [uncertain]."
+                : "OCR has extracted the following text. Please correct and supplement it according to the image, especially table values:\n" + truncate(ocrReference, 3000);
 
         int maxRetries = 2;
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
@@ -244,7 +294,11 @@ public class ConsultationService {
                     log.error("Vision model failed after {} retries for: {}", maxRetries, fileName);
                     return "";
                 }
-                try { Thread.sleep(3000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+                try {
+                    Thread.sleep(3000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
         return "";
@@ -269,21 +323,27 @@ public class ConsultationService {
         }
     }
 
-    private String extractPatientInfo(String diagnosisText) {
+    private PatientStructuredInfo extractPatientInfo(String diagnosisText) {
         ChatClient chatClient = chatClientBuilder.build();
-        return chatClient.prompt()
-                .system(promptService.getExtractionPrompt())
+        String jsonText = chatClient.prompt()
+                .system(promptService.getStructuredExtractionPrompt())
                 .user(diagnosisText)
+                .options(OllamaOptions.builder()
+                        .model("qwen2.5:7b-instruct")
+                        .temperature(0.1)
+                        .build())
                 .call()
                 .content();
+        return structuredExtractionService.parseAndValidate(jsonText, diagnosisText);
     }
 
-    private List<Document> searchRelevantDocuments(String patientSummary) {
+    private List<Document> searchRelevantDocuments(PatientStructuredInfo patientInfo) {
         try {
+            String query = buildRetrievalQuery(patientInfo);
             SearchRequest request = SearchRequest.builder()
-                    .query(patientSummary)
+                    .query(query)
                     .topK(5)
-                    .similarityThreshold(0.3)
+                    .similarityThreshold(0.35)
                     .build();
             List<Document> results = vectorStore.similaritySearch(request);
             return results != null ? results : Collections.emptyList();
@@ -291,6 +351,27 @@ public class ConsultationService {
             log.warn("Vector search returned no results or failed: {}", e.getMessage());
             return Collections.emptyList();
         }
+    }
+
+    private String buildRetrievalQuery(PatientStructuredInfo patientInfo) {
+        List<String> parts = new ArrayList<>();
+        parts.addAll(patientInfo.getDiagnoses());
+        parts.addAll(patientInfo.getChiefComplaints());
+        parts.addAll(patientInfo.getRiskFactors());
+        for (PatientStructuredInfo.LabResult lab : patientInfo.getLabResults()) {
+            if (lab.getFlag() != null && !lab.getFlag().isBlank()) {
+                parts.add(lab.getItem() + " " + lab.getFlag());
+            }
+        }
+        if (patientInfo.getBasicInfo() != null) {
+            if (patientInfo.getBasicInfo().getAge() != null) {
+                parts.add(patientInfo.getBasicInfo().getAge());
+            }
+            if (patientInfo.getBasicInfo().getGender() != null) {
+                parts.add(patientInfo.getBasicInfo().getGender());
+            }
+        }
+        return String.join("; ", parts);
     }
 
     private void streamMedicationAnalysis(String patientSummary, List<Document> relevantDocs,
@@ -319,9 +400,12 @@ public class ConsultationService {
                         sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                                 .step(WorkflowStep.LLM_ANALYSIS)
                                 .status("error")
-                                .message("生成失败: " + error.getMessage())
+                                .message("Generation failed: " + error.getMessage())
                                 .build());
-                        try { emitter.completeWithError(error); } catch (Exception ignored) {}
+                        try {
+                            emitter.completeWithError(error);
+                        } catch (Exception ignored) {
+                        }
                     }
                 })
                 .doOnComplete(() -> {
@@ -329,9 +413,12 @@ public class ConsultationService {
                         sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                                 .step(WorkflowStep.LLM_ANALYSIS)
                                 .status("done")
-                                .message("分析完成")
+                                .message("Analysis completed")
                                 .build());
-                        try { emitter.complete(); } catch (Exception ignored) {}
+                        try {
+                            emitter.complete();
+                        } catch (Exception ignored) {
+                        }
                     }
                 })
                 .blockLast();
@@ -343,12 +430,14 @@ public class ConsultationService {
         AtomicInteger elapsed = new AtomicInteger(0);
 
         ScheduledFuture<?> heartbeat = heartbeatScheduler.scheduleAtFixedRate(() -> {
-            if (emitterDead.get()) return;
+            if (emitterDead.get()) {
+                return;
+            }
             int secs = elapsed.addAndGet(10);
             sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
                     .step(step)
                     .status("running")
-                    .message(message + "（已耗时 " + secs + " 秒，请耐心等待）")
+                    .message(message + " (elapsed " + secs + " seconds)")
                     .build());
         }, 10, 10, TimeUnit.SECONDS);
 
@@ -361,19 +450,30 @@ public class ConsultationService {
     }
 
     private void sendEvent(SseEmitter emitter, AtomicBoolean emitterDead, WorkflowStepEvent event) {
-        if (emitterDead.get()) return;
+        if (emitterDead.get()) {
+            return;
+        }
         try {
-            emitter.send(SseEmitter.event()
-                    .name("workflow")
-                    .data(event, MediaType.APPLICATION_JSON));
+            emitter.send(SseEmitter.event().name("workflow").data(event, MediaType.APPLICATION_JSON));
         } catch (IOException | IllegalStateException e) {
             log.warn("Failed to send SSE event (connection likely closed): {}", e.getMessage());
             emitterDead.set(true);
         }
     }
 
+    private String toJson(Object value) {
+        try {
+            return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            return String.valueOf(value);
+        }
+    }
+
     private String truncate(String text, int maxLength) {
-        if (text == null) return "";
+        if (text == null) {
+            return "";
+        }
         return text.length() <= maxLength ? text : text.substring(0, maxLength) + "...";
     }
 }
+

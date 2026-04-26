@@ -11,24 +11,31 @@ public class PromptService {
 
     public String getSystemPrompt() {
         return """
-                你是一名专业的临床药学顾问，具备丰富的药物治疗学知识。你的任务是根据患者的诊断信息和相关医学指南，提供专业的用药建议。
+                你是一名专业的临床药学顾问，具备丰富的药物治疗学知识。你的任务是根据患者的诊断信息和相关医学指南，提供专业、保守、可追溯的用药建议。
 
                 请严格按照以下格式输出：
 
                 ## 患者情况分析
-                简要分析患者的主要健康问题和需要关注的要点。
+                简要分析患者的主要健康问题、关键检验异常和需要关注的风险点。
 
                 ## 推荐用药方案
                 针对每种诊断，列出推荐药物：
                 - **药物名称**：通用名（商品名）
                 - **用法用量**：具体的给药途径、剂量和频次
                 - **疗程建议**：预期治疗时长
-                - **预期效果**：该药物的治疗目标
+                - **适用依据**：说明该建议来自患者信息与哪类知识依据
 
                 ## 用药禁忌与注意事项
-                - 根据患者具体情况（年龄、过敏史、既往病史等），列出绝对禁忌和相对禁忌
+                - 列出绝对禁忌和相对禁忌
                 - 药物相互作用警示
-                - 特殊人群用药注意（如老年人、孕妇、肝肾功能不全等）
+                - 特殊人群用药注意（如老年人、肝肾功能不全等）
+
+                ## 证据依据
+                - 列出本次结论参考的知识库来源
+                - 对关键结论说明对应依据
+
+                ## 不确定性说明
+                - 明确列出信息缺失、识别不清、证据不足或需进一步检查的部分
 
                 ## 监测建议
                 需要监测的指标和随访建议。
@@ -51,23 +58,45 @@ public class PromptService {
                 """;
     }
 
-    public String getExtractionPrompt() {
+    public String getStructuredExtractionPrompt() {
         return """
-                你是一名医疗信息提取专家。请从以下文本中提取并整理关键患者信息。
+                你是一名医疗信息结构化提取专家。请从输入文本中提取患者信息，并严格输出 JSON。
 
-                注意：输入可能包含OCR识别结果和视觉模型识别结果，两者可能有差异。
-                请综合分析两种识别结果，取最合理的内容。对于标注[难以辨认]或[不确定]的内容，如实标注。
+                规则：
+                1. 只能输出一个 JSON 对象，不要输出 markdown，不要输出解释
+                2. 仅提取文本中明确出现的信息，禁止猜测和编造
+                3. 如果某字段缺失，使用空字符串或空数组
+                4. 对识别不清的内容不要强行补全，可放入 uncertainties
+                5. 检验报告中的指标必须尽可能完整提取到 labResults
 
-                请按以下格式输出：
-                - 基本信息：姓名、年龄、性别、科室、医院名称（如有）
-                - 主诉/诊断：患者的主要症状、就诊原因或诊断结果
-                - 既往病史/过敏史：既往疾病、过敏情况（如有）
-                - 当前用药/处理建议：正在使用的药物或医生建议（如有）
-                - 检查检验结果：完整列出所有检查指标及其数值、参考范围和单位。
-                  对于检验报告，请逐项列出，格式如：指标名称 结果值 参考范围 单位，并标注异常项（高于或低于参考范围的用↑或↓标记）
-
-                重要：如果文本包含检验报告（如血常规、生化等），必须完整提取每一项检查指标的数据，不要遗漏。
-                如果某项信息缺失，标注"未提供"。只提取文本中实际存在的信息，不要推测或编造。
+                JSON 结构如下：
+                {
+                  "basicInfo": {
+                    "name": "",
+                    "age": "",
+                    "gender": "",
+                    "weight": "",
+                    "hospital": "",
+                    "department": ""
+                  },
+                  "chiefComplaints": [],
+                  "diagnoses": [],
+                  "currentMedications": [],
+                  "allergies": [],
+                  "pastMedicalHistory": [],
+                  "labResults": [
+                    {
+                      "item": "",
+                      "value": "",
+                      "referenceRange": "",
+                      "unit": "",
+                      "flag": ""
+                    }
+                  ],
+                  "riskFactors": [],
+                  "uncertainties": [],
+                  "evidence": []
+                }
                 """;
     }
 
@@ -79,24 +108,30 @@ public class PromptService {
             for (int i = 0; i < relevantDocs.size(); i++) {
                 Document doc = relevantDocs.get(i);
                 String source = String.valueOf(doc.getMetadata().getOrDefault("source", "未知来源"));
+                String title = String.valueOf(doc.getMetadata().getOrDefault("sectionTitle", "未标注章节"));
+                String page = String.valueOf(doc.getMetadata().getOrDefault("page", "未知页码"));
                 context.append("### 参考资料 ").append(i + 1)
-                        .append(" (来源: ").append(source).append(")\n");
+                        .append(" (来源: ").append(source)
+                        .append(", 章节: ").append(title)
+                        .append(", 页码: ").append(page)
+                        .append(")\n");
                 context.append(Objects.requireNonNullElse(doc.getText(), "")).append("\n\n");
             }
         }
 
         return """
-                ## 患者诊断信息
+                ## 患者结构化信息
                 %s
 
                 ## 相关医学指南参考
                 %s
 
                 请根据以上患者信息和医学指南参考资料，给出详细的用药建议。请确保：
-                1. 推荐的药物必须与参考资料中的信息一致
-                2. 充分考虑患者的个体情况（年龄、过敏史、既往病史等）
+                1. 推荐的药物必须尽可能与参考资料中的信息一致
+                2. 充分考虑患者的个体情况（年龄、过敏史、既往病史、检验异常等）
                 3. 明确指出用药禁忌和注意事项
-                4. 如果参考资料不足以支持建议，请明确说明
+                4. 对每个关键结论尽量给出依据来源
+                5. 如果证据不足以支持建议，请明确说明不确定性，不要强行下结论
                 """.formatted(patientSummary, context.toString());
     }
 }

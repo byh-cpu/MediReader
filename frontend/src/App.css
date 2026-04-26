@@ -92,13 +92,29 @@ body {
   line-height: 1.8;
 }
 
+.summary-descriptions .ant-descriptions-item-label {
+  width: 120px;
+  font-weight: 600;
+}
+
+.section-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: #1a1a2e;
+}
+
+.muted-text {
+  color: #999;
+}
+
 .source-list {
   margin: 16px 0;
 }
 
 .source-item {
-  padding: 8px 12px;
-  margin-bottom: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
   background: #f6f8fa;
   border-radius: 6px;
   border-left: 3px solid #1890ff;
@@ -109,7 +125,15 @@ body {
 .source-item .source-name {
   font-weight: 600;
   color: #1890ff;
-  margin-bottom: 4px;
+}
+
+.source-name-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
 }
 
 .cursor-blink {

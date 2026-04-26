@@ -5,14 +5,15 @@ import PdfUploader from '../components/PdfUploader';
 import WorkflowSteps from '../components/WorkflowSteps';
 import StreamingAnswer from '../components/StreamingAnswer';
 import PatientSummary from '../components/PatientSummary';
-import { analyzeConsultation, WorkflowEvent } from '../services/api';
+import {
+  analyzeConsultation,
+  type EvaluationMetrics,
+  type SourceItem,
+  type StructuredInfo,
+  type WorkflowEvent,
+} from '../services/api';
 
 const STEP_ORDER = ['PDF_PARSING', 'INFO_EXTRACTION', 'RAG_RETRIEVAL', 'LLM_ANALYSIS'];
-
-interface Source {
-  content: string;
-  source: string;
-}
 
 const isImageFile = (file: File) => file.type.startsWith('image/');
 
@@ -21,7 +22,9 @@ const ConsultationPage: React.FC = () => {
   const [currentStep, setCurrentStep] = useState(-1);
   const [stepStatuses, setStepStatuses] = useState<Record<string, string>>({});
   const [patientSummary, setPatientSummary] = useState('');
-  const [sources, setSources] = useState<Source[]>([]);
+  const [structuredInfo, setStructuredInfo] = useState<StructuredInfo | null>(null);
+  const [sources, setSources] = useState<SourceItem[]>([]);
+  const [evaluationMetrics, setEvaluationMetrics] = useState<EvaluationMetrics | null>(null);
   const [streamingText, setStreamingText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [completed, setCompleted] = useState(false);
@@ -40,7 +43,9 @@ const ConsultationPage: React.FC = () => {
     setStepStatuses({});
     setStepMessages({});
     setPatientSummary('');
+    setStructuredInfo(null);
     setSources([]);
+    setEvaluationMetrics(null);
     setStreamingText('');
     setIsStreaming(false);
     setCompleted(false);
@@ -61,16 +66,27 @@ const ConsultationPage: React.FC = () => {
         }
         if (event.step === 'LLM_ANALYSIS') {
           setIsStreaming(true);
+          if (event.data?.evaluationMetrics) {
+            setEvaluationMetrics(event.data.evaluationMetrics as EvaluationMetrics);
+          }
         }
         break;
 
       case 'done':
         setStepStatuses((prev) => ({ ...prev, [event.step]: 'done' }));
-        if (event.step === 'INFO_EXTRACTION' && event.data?.patientSummary) {
-          setPatientSummary(event.data.patientSummary as string);
+        if (event.message) {
+          setStepMessages((prev) => ({ ...prev, [event.step]: event.message! }));
+        }
+        if (event.step === 'INFO_EXTRACTION') {
+          if (event.data?.patientSummary) {
+            setPatientSummary(event.data.patientSummary as string);
+          }
+          if (event.data?.structuredInfo) {
+            setStructuredInfo(event.data.structuredInfo as StructuredInfo);
+          }
         }
         if (event.step === 'RAG_RETRIEVAL' && event.data?.sources) {
-          setSources(event.data.sources as Source[]);
+          setSources(event.data.sources as SourceItem[]);
         }
         if (event.step === 'LLM_ANALYSIS') {
           setIsStreaming(false);
@@ -179,7 +195,12 @@ const ConsultationPage: React.FC = () => {
 
           <Divider />
 
-          <PatientSummary patientSummary={patientSummary} sources={sources} />
+          <PatientSummary
+            patientSummary={patientSummary}
+            structuredInfo={structuredInfo}
+            sources={sources}
+            evaluationMetrics={evaluationMetrics}
+          />
 
           <StreamingAnswer content={streamingText} isStreaming={isStreaming} />
 

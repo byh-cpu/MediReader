@@ -73,9 +73,11 @@ public class KnowledgeBaseService {
         Resource resource = new FileSystemResource(savedFile);
         List<Document> chunks = pdfParserService.parsePdfAndSplit(resource);
 
+        int chunkIndex = 0;
         for (Document chunk : chunks) {
             chunk.getMetadata().put("documentId", docId);
             chunk.getMetadata().put("source", file.getOriginalFilename());
+            chunk.getMetadata().putIfAbsent("chunkIndex", chunkIndex++);
         }
 
         List<String> chunkIds = new ArrayList<>();

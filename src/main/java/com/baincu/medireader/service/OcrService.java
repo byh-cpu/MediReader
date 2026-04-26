@@ -3,7 +3,10 @@ package com.baincu.medireader.service;
 import lombok.extern.slf4j.Slf4j;
 import net.sourceforge.tess4j.Tesseract;
 import net.sourceforge.tess4j.TesseractException;
+import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.core.io.Resource;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
@@ -13,10 +16,15 @@ import java.awt.image.BufferedImage;
 import java.awt.image.ConvolveOp;
 import java.awt.image.Kernel;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.stream.Collectors;
 
 @Service
 @Slf4j
@@ -92,6 +100,56 @@ public class OcrService {
         }
     }
 
+    public String extractTextFromPdfPages(Resource pdfResource) {
+        if (!tesseractAvailable) {
+            return "";
+        }
+        try {
+            org.apache.pdfbox.pdmodel.PDDocument document = org.apache.pdfbox.Loader.loadPDF(pdfResource.getInputStream().readAllBytes());
+            org.apache.pdfbox.rendering.PDFRenderer renderer = new org.apache.pdfbox.rendering.PDFRenderer(document);
+            List<String> pageTexts = new ArrayList<>();
+            for (int i = 0; i < document.getNumberOfPages(); i++) {
+                BufferedImage image = renderer.renderImageWithDPI(i, 220);
+                BufferedImage processed = preprocessForOcr(image);
+                String text = cleanOcrText(tesseract.doOCR(processed));
+                if (!text.isBlank()) {
+                    pageTexts.add("第" + (i + 1) + "页:\n" + text);
+                }
+            }
+            document.close();
+            return String.join("\n\n", pageTexts);
+        } catch (Exception e) {
+            log.warn("PDF OCR failed: {}", e.getMessage());
+            return "";
+        }
+    }
+
+    public List<Document> splitOcrPdfToDocuments(Resource pdfResource, String sourceName) {
+        String text = extractTextFromPdfPages(pdfResource);
+        if (text.isBlank()) {
+            return List.of();
+        }
+        String[] pages = text.split("\\n\\n第");
+        List<Document> docs = new ArrayList<>();
+        for (int i = 0; i < pages.length; i++) {
+            String pageText = pages[i];
+            if (i > 0) {
+                pageText = "第" + pageText;
+            }
+            String cleaned = cleanOcrText(pageText);
+            if (cleaned.length() < 20) {
+                continue;
+            }
+            docs.add(new Document(cleaned, java.util.Map.of(
+                    "source", sourceName,
+                    "page", String.valueOf(i + 1),
+                    "sectionTitle", inferSectionTitle(cleaned),
+                    "parseMethod", "ocr"
+            )));
+        }
+        return docs;
+    }
+
     public BufferedImage preprocessForOcr(BufferedImage original) {
         int w = original.getWidth();
         int h = original.getHeight();
@@ -146,6 +204,11 @@ public class OcrService {
             }
         }
         return result;
+    }
+
+    private String inferSectionTitle(String text) {
+        String firstLine = text.lines().filter(Objects::nonNull).map(String::trim).filter(s -> !s.isEmpty()).findFirst().orElse("OCR分页内容");
+        return firstLine.length() <= 30 ? firstLine : firstLine.substring(0, 30);
     }
 
     private String cleanOcrText(String text) {
