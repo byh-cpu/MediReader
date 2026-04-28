@@ -1,11 +1,13 @@
 package com.baincu.medireader.controller;
 
+import com.baincu.medireader.model.dto.PatientStructuredInfo;
 import com.baincu.medireader.service.ConsultationService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -72,7 +74,7 @@ public class ConsultationController {
 
         workflowExecutor.execute(() -> {
             try {
-                consultationService.analyzePatientDiagnosis(uploadedFiles, emitter);
+                consultationService.extractPatientInformationForReview(uploadedFiles, emitter);
             } catch (Exception e) {
                 log.error("Workflow execution failed", e);
                 try { emitter.completeWithError(e); } catch (Exception ignored) {}
@@ -82,6 +84,22 @@ public class ConsultationController {
         emitter.onTimeout(() -> log.warn("SSE connection timed out for: {}", displayName));
         emitter.onError(e -> log.warn("SSE error for: {}", displayName, e));
 
+        return emitter;
+    }
+
+    @PostMapping(value = "/continue", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter continueAnalysis(@RequestBody PatientStructuredInfo patientInfo) {
+        SseEmitter emitter = new SseEmitter(600_000L);
+        workflowExecutor.execute(() -> {
+            try {
+                consultationService.continueAnalysisWithReviewedInfo(patientInfo, emitter);
+            } catch (Exception e) {
+                log.error("Continue workflow execution failed", e);
+                try { emitter.completeWithError(e); } catch (Exception ignored) {}
+            }
+        });
+        emitter.onTimeout(() -> log.warn("SSE connection timed out for reviewed patient info"));
+        emitter.onError(e -> log.warn("SSE error for reviewed patient info", e));
         return emitter;
     }
 }

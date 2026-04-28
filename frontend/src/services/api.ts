@@ -104,23 +104,19 @@ export const deleteKnowledge = async (id: string): Promise<void> => {
   }
 };
 
-export const analyzeConsultation = (
-  files: File | File[],
+const connectWorkflow = (
+  url: string,
+  request: { body: BodyInit; headers?: Record<string, string> },
   onEvent: (event: WorkflowEvent) => void,
   onError?: (error: unknown) => void,
   onComplete?: () => void,
 ): AbortController => {
-  const formData = new FormData();
-  const fileList = Array.isArray(files) ? files : [files];
-  for (const f of fileList) {
-    formData.append('files', f);
-  }
-
   const ctrl = new AbortController();
 
-  fetchEventSource(`${BASE_URL}/consultation/analyze`, {
+  fetchEventSource(url, {
     method: 'POST',
-    body: formData,
+    headers: request.headers,
+    body: request.body,
     signal: ctrl.signal,
     openWhenHidden: true,
     onmessage(ev) {
@@ -144,3 +140,40 @@ export const analyzeConsultation = (
 
   return ctrl;
 };
+
+export const analyzeConsultation = (
+  files: File | File[],
+  onEvent: (event: WorkflowEvent) => void,
+  onError?: (error: unknown) => void,
+  onComplete?: () => void,
+): AbortController => {
+  const formData = new FormData();
+  const fileList = Array.isArray(files) ? files : [files];
+  for (const f of fileList) {
+    formData.append('files', f);
+  }
+
+  return connectWorkflow(
+    `${BASE_URL}/consultation/analyze`,
+    { body: formData },
+    onEvent,
+    onError,
+    onComplete,
+  );
+};
+
+export const continueConsultation = (
+  structuredInfo: StructuredInfo,
+  onEvent: (event: WorkflowEvent) => void,
+  onError?: (error: unknown) => void,
+  onComplete?: () => void,
+): AbortController => connectWorkflow(
+  `${BASE_URL}/consultation/continue`,
+  {
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(structuredInfo),
+  },
+  onEvent,
+  onError,
+  onComplete,
+);

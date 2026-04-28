@@ -108,6 +108,23 @@ body {
   color: #999;
 }
 
+.raw-json-block {
+  max-height: 260px;
+  overflow: auto;
+  padding: 12px;
+  background: #0f172a;
+  color: #d6e4ff;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.raw-json-block pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .source-list {
   margin: 16px 0;
 }

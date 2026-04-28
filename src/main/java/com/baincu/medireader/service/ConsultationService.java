@@ -21,6 +21,9 @@ import org.springframework.util.MimeTypeUtils;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import javax.imageio.ImageIO;
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -235,6 +238,166 @@ public class ConsultationService {
         }
     }
 
+    public void extractPatientInformationForReview(List<UploadedFile> files, SseEmitter emitter) {
+        AtomicBoolean emitterDead = new AtomicBoolean(false);
+        emitter.onTimeout(() -> emitterDead.set(true));
+        emitter.onError(e -> emitterDead.set(true));
+        emitter.onCompletion(() -> emitterDead.set(true));
+
+        long parseStart = System.currentTimeMillis();
+        try {
+            sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                    .step(WorkflowStep.PDF_PARSING)
+                    .status("running")
+                    .message("Parsing uploaded files...")
+                    .build());
+
+            List<String> textParts = new ArrayList<>();
+            List<String> fileNames = new ArrayList<>();
+            for (UploadedFile file : files) {
+                if (emitterDead.get()) {
+                    return;
+                }
+                fileNames.add(file.fileName());
+                if ("pdf".equals(file.type())) {
+                    Resource resource = new ByteArrayResource(file.data()) {
+                        @Override
+                        public String getFilename() {
+                            return file.fileName();
+                        }
+                    };
+                    textParts.add(pdfParserService.extractFullText(resource));
+                } else if ("image".equals(file.type())) {
+                    String text = executeWithHeartbeat(
+                            emitter,
+                            emitterDead,
+                            WorkflowStep.PDF_PARSING,
+                            "Recognizing image [" + file.fileName() + "] with OCR and vision model",
+                            () -> extractTextFromImage(file.data(), file.fileName())
+                    );
+                    textParts.add(text);
+                }
+            }
+
+            String diagnosisText = String.join("\n\n", textParts);
+            long parseCostMs = System.currentTimeMillis() - parseStart;
+            sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                    .step(WorkflowStep.PDF_PARSING)
+                    .status("done")
+                    .message("File parsing completed (" + fileNames.size() + " files)")
+                    .data(Map.of(
+                            "textLength", diagnosisText.length(),
+                            "preview", truncate(diagnosisText, 300),
+                            "files", fileNames,
+                            "parseCostMs", parseCostMs
+                    ))
+                    .build());
+
+            sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                    .step(WorkflowStep.INFO_EXTRACTION)
+                    .status("running")
+                    .message("Extracting structured patient information...")
+                    .build());
+
+            long extractStart = System.currentTimeMillis();
+            PatientStructuredInfo patientInfo = extractPatientInfo(diagnosisText);
+            String patientSummary = toJson(patientInfo);
+            long extractCostMs = System.currentTimeMillis() - extractStart;
+
+            sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                    .step(WorkflowStep.INFO_EXTRACTION)
+                    .status("done")
+                    .message("患者信息已识别，请核对并编辑后继续分析")
+                    .data(Map.of(
+                            "patientSummary", patientSummary,
+                            "structuredInfo", patientInfo,
+                            "extractCostMs", extractCostMs,
+                            "awaitingReview", true
+                    ))
+                    .build());
+            emitter.complete();
+        } catch (Exception e) {
+            log.error("Patient information extraction failed", e);
+            if (!emitterDead.get()) {
+                sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                        .step(WorkflowStep.INFO_EXTRACTION)
+                        .status("error")
+                        .message("信息识别失败: " + e.getMessage())
+                        .build());
+                emitter.completeWithError(e);
+            }
+        }
+    }
+
+    public void continueAnalysisWithReviewedInfo(PatientStructuredInfo patientInfo, SseEmitter emitter) {
+        AtomicBoolean emitterDead = new AtomicBoolean(false);
+        emitter.onTimeout(() -> emitterDead.set(true));
+        emitter.onError(e -> emitterDead.set(true));
+        emitter.onCompletion(() -> emitterDead.set(true));
+
+        try {
+            sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                    .step(WorkflowStep.RAG_RETRIEVAL)
+                    .status("running")
+                    .message("Retrieving relevant medical knowledge...")
+                    .build());
+
+            long retrievalStart = System.currentTimeMillis();
+            List<Document> relevantDocs = searchRelevantDocuments(patientInfo);
+            long retrievalCostMs = System.currentTimeMillis() - retrievalStart;
+            List<Map<String, String>> sources = relevantDocs.stream()
+                    .map(doc -> Map.of(
+                            "content", truncate(doc.getText() != null ? doc.getText() : "", 200),
+                            "source", String.valueOf(doc.getMetadata().getOrDefault("source", "unknown")),
+                            "sectionTitle", String.valueOf(doc.getMetadata().getOrDefault("sectionTitle", "unknown section")),
+                            "page", String.valueOf(doc.getMetadata().getOrDefault("page", "unknown page"))
+                    ))
+                    .toList();
+
+            sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                    .step(WorkflowStep.RAG_RETRIEVAL)
+                    .status("done")
+                    .message("Retrieved " + relevantDocs.size() + " relevant medical references")
+                    .data(Map.of(
+                            "sources", sources,
+                            "count", relevantDocs.size(),
+                            "retrievalCostMs", retrievalCostMs
+                    ))
+                    .build());
+
+            EvaluationMetrics metrics = EvaluationMetrics.builder()
+                    .inputFileCount(0)
+                    .parsedTextLength(toJson(patientInfo).length())
+                    .retrievedDocumentCount(relevantDocs.size())
+                    .extractedDiagnosisCount(patientInfo.getDiagnoses().size())
+                    .extractedLabResultCount(patientInfo.getLabResults().size())
+                    .uncertaintyCount(patientInfo.getUncertainties().size())
+                    .parseCostMs(0)
+                    .extractCostMs(0)
+                    .retrievalCostMs(retrievalCostMs)
+                    .build();
+
+            sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                    .step(WorkflowStep.LLM_ANALYSIS)
+                    .status("running")
+                    .message("Generating medication advice...")
+                    .data(Map.of("evaluationMetrics", metrics))
+                    .build());
+
+            streamMedicationAnalysis(toJson(patientInfo), relevantDocs, emitter, emitterDead);
+        } catch (Exception e) {
+            log.error("Reviewed consultation analysis failed", e);
+            if (!emitterDead.get()) {
+                sendEvent(emitter, emitterDead, WorkflowStepEvent.builder()
+                        .step(WorkflowStep.LLM_ANALYSIS)
+                        .status("error")
+                        .message("分析失败: " + e.getMessage())
+                        .build());
+                emitter.completeWithError(e);
+            }
+        }
+    }
+
     private String extractTextFromImage(byte[] imageData, String fileName) {
         StringBuilder combined = new StringBuilder();
         String ocrText = "";
@@ -269,8 +432,8 @@ public class ConsultationService {
         };
 
         String userText = ocrReference.isBlank()
-                ? "Please carefully extract all text from this medical document image, including every row in tables. For uncertain handwriting, mark it as [uncertain]."
-                : "OCR has extracted the following text. Please correct and supplement it according to the image, especially table values:\n" + truncate(ocrReference, 3000);
+                ? "请完整识别这张医疗文档/医院系统截图。先按可见分区列出文字，再单独整理患者基本信息、诊断、检验检查、用药、病史等字段。不要遗漏浅色小字和表格行。"
+                : "下面是本地 OCR 初步识别结果，可能有错漏。请根据图片逐项校正和补充，尤其注意浅色小字、红色诊断、黄色标记、表格数值、单位和参考范围。\n\n[OCR参考文本]\n" + truncate(ocrReference, 5000);
 
         int maxRetries = 2;
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
@@ -311,16 +474,30 @@ public class ConsultationService {
                 log.warn("ImageIO cannot read image: {}, sending raw bytes", fileName);
                 return imageData;
             }
-            BufferedImage rgbImage = new BufferedImage(image.getWidth(), image.getHeight(), BufferedImage.TYPE_INT_RGB);
-            rgbImage.createGraphics().drawImage(image, 0, 0, java.awt.Color.WHITE, null);
+            BufferedImage rgbImage = createVisionImage(image);
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             ImageIO.write(rgbImage, "jpg", out);
-            log.info("Converted image to JPEG: {} ({}KB -> {}KB)", fileName, imageData.length / 1024, out.size() / 1024);
+            log.info("Converted image to enhanced JPEG: {} ({}KB -> {}KB, {}x{})", fileName, imageData.length / 1024, out.size() / 1024, rgbImage.getWidth(), rgbImage.getHeight());
             return out.toByteArray();
         } catch (IOException e) {
             log.warn("Failed to convert image to JPEG: {}, sending raw bytes", fileName, e);
             return imageData;
         }
+    }
+
+    private BufferedImage createVisionImage(BufferedImage image) {
+        int targetWidth = Math.max(image.getWidth(), 1600);
+        int targetHeight = Math.max(1, (int) Math.round(image.getHeight() * (targetWidth / (double) image.getWidth())));
+        BufferedImage rgbImage = new BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = rgbImage.createGraphics();
+        g.setColor(Color.WHITE);
+        g.fillRect(0, 0, targetWidth, targetHeight);
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+        g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.drawImage(image, 0, 0, targetWidth, targetHeight, Color.WHITE, null);
+        g.dispose();
+        return rgbImage;
     }
 
     private PatientStructuredInfo extractPatientInfo(String diagnosisText) {

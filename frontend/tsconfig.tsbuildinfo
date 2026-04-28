@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/vite-env.d.ts","./src/components/patientsummary.tsx","./src/components/pdfuploader.tsx","./src/components/streaminganswer.tsx","./src/components/workflowsteps.tsx","./src/pages/consultationpage.tsx","./src/pages/knowledgepage.tsx","./src/services/api.ts"],"version":"5.9.3"}

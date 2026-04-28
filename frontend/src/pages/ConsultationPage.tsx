@@ -1,12 +1,13 @@
 import { useState, useRef, useCallback } from 'react';
 import { Button, message, Alert, Divider, Image, Space, Tag } from 'antd';
-import { ClearOutlined, FileTextOutlined, PictureOutlined, FilePdfOutlined } from '@ant-design/icons';
+import { CheckCircleOutlined, ClearOutlined, FileTextOutlined, PictureOutlined, FilePdfOutlined } from '@ant-design/icons';
 import PdfUploader from '../components/PdfUploader';
 import WorkflowSteps from '../components/WorkflowSteps';
 import StreamingAnswer from '../components/StreamingAnswer';
 import PatientSummary from '../components/PatientSummary';
 import {
   analyzeConsultation,
+  continueConsultation,
   type EvaluationMetrics,
   type SourceItem,
   type StructuredInfo,
@@ -28,6 +29,8 @@ const ConsultationPage: React.FC = () => {
   const [streamingText, setStreamingText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [completed, setCompleted] = useState(false);
+  const [awaitingReview, setAwaitingReview] = useState(false);
+  const [continuing, setContinuing] = useState(false);
   const [stepMessages, setStepMessages] = useState<Record<string, string>>({});
   const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [previewUrls, setPreviewUrls] = useState<string[]>([]);
@@ -49,6 +52,8 @@ const ConsultationPage: React.FC = () => {
     setStreamingText('');
     setIsStreaming(false);
     setCompleted(false);
+    setAwaitingReview(false);
+    setContinuing(false);
     setSelectedFiles([]);
     previewUrls.forEach((url) => URL.revokeObjectURL(url));
     setPreviewUrls([]);
@@ -84,6 +89,11 @@ const ConsultationPage: React.FC = () => {
           if (event.data?.structuredInfo) {
             setStructuredInfo(event.data.structuredInfo as StructuredInfo);
           }
+          if (event.data?.awaitingReview) {
+            setAwaitingReview(true);
+            setAnalyzing(false);
+            message.success('患者信息已识别，请核对修改后继续分析');
+          }
         }
         if (event.step === 'RAG_RETRIEVAL' && event.data?.sources) {
           setSources(event.data.sources as SourceItem[]);
@@ -92,6 +102,7 @@ const ConsultationPage: React.FC = () => {
           setIsStreaming(false);
           setCompleted(true);
           setAnalyzing(false);
+          setContinuing(false);
         }
         break;
 
@@ -106,6 +117,7 @@ const ConsultationPage: React.FC = () => {
         message.error(event.message || '分析出错');
         setIsStreaming(false);
         setAnalyzing(false);
+        setContinuing(false);
         break;
     }
   }, []);
@@ -118,6 +130,7 @@ const ConsultationPage: React.FC = () => {
     setPreviewUrls(urls);
     setSelectedFiles(files);
     setAnalyzing(true);
+    setAwaitingReview(false);
     setCurrentStep(0);
 
     ctrlRef.current = analyzeConsultation(
@@ -139,6 +152,36 @@ const ConsultationPage: React.FC = () => {
     startAnalysis([file]);
   };
 
+  const continueWithReviewedInfo = () => {
+    if (!structuredInfo) {
+      message.warning('请先完成患者信息识别');
+      return;
+    }
+    setAwaitingReview(false);
+    setContinuing(true);
+    setCurrentStep(2);
+    setStepStatuses((prev) => ({ ...prev, RAG_RETRIEVAL: 'running' }));
+    setSources([]);
+    setEvaluationMetrics(null);
+    setStreamingText('');
+    setIsStreaming(false);
+    setCompleted(false);
+
+    ctrlRef.current = continueConsultation(
+      structuredInfo,
+      handleEvent,
+      () => {
+        message.error('连接异常，请检查后端服务是否正常运行');
+        setContinuing(false);
+        setIsStreaming(false);
+      },
+      () => {
+        setContinuing(false);
+        setIsStreaming(false);
+      },
+    );
+  };
+
   const hasStarted = currentStep >= 0;
 
   return (
@@ -155,7 +198,7 @@ const ConsultationPage: React.FC = () => {
       <div className="upload-section">
         <PdfUploader
           onFileSelected={handleFileSelected}
-          disabled={analyzing}
+          disabled={analyzing || continuing}
           acceptImages
           hint="上传患者诊断书、病历 PDF 或检查报告照片，系统将自动识别并生成用药建议"
         />
@@ -200,7 +243,28 @@ const ConsultationPage: React.FC = () => {
             structuredInfo={structuredInfo}
             sources={sources}
             evaluationMetrics={evaluationMetrics}
+            editable={awaitingReview}
+            onStructuredInfoChange={setStructuredInfo}
           />
+
+          {awaitingReview && structuredInfo && (
+            <div style={{ marginTop: 16, marginBottom: 16, textAlign: 'center' }}>
+              <Space>
+                <Button icon={<ClearOutlined />} onClick={reset}>
+                  重新上传
+                </Button>
+                <Button
+                  type="primary"
+                  size="large"
+                  icon={<CheckCircleOutlined />}
+                  onClick={continueWithReviewedInfo}
+                  loading={continuing}
+                >
+                  保存并继续用药分析
+                </Button>
+              </Space>
+            </div>
+          )}
 
           <StreamingAnswer content={streamingText} isStreaming={isStreaming} />
 

@@ -1,6 +1,6 @@
 import { Upload, message } from 'antd';
 import { InboxOutlined } from '@ant-design/icons';
-import type { UploadFile } from 'antd';
+import type { RcFile, UploadFile } from 'antd/es/upload/interface';
 
 const { Dragger } = Upload;
 
@@ -30,11 +30,10 @@ const PdfUploader: React.FC<PdfUploaderProps> = ({
 }) => {
   const acceptStr = acceptImages ? '.pdf,.jpg,.jpeg,.png' : '.pdf';
 
-  const beforeUpload = (file: UploadFile) => {
-    const type = (file as unknown as File).type;
+  const beforeUpload = (file: RcFile) => {
     const isAccepted = acceptImages
-      ? ACCEPT_TYPES.includes(type)
-      : type === 'application/pdf';
+      ? ACCEPT_TYPES.includes(file.type)
+      : file.type === 'application/pdf';
 
     if (!isAccepted) {
       message.error(acceptImages ? '仅支持 PDF 和图片格式文件' : '仅支持 PDF 格式文件');
@@ -42,7 +41,7 @@ const PdfUploader: React.FC<PdfUploaderProps> = ({
     }
 
     if (!multiple) {
-      onFileSelected(file as unknown as File);
+      onFileSelected(file);
     }
     return false;
   };
@@ -51,7 +50,7 @@ const PdfUploader: React.FC<PdfUploaderProps> = ({
     if (multiple && onFilesSelected && info.fileList.length > 0) {
       const rawFiles = info.fileList
         .map((f) => f.originFileObj)
-        .filter((f): f is File => !!f);
+        .filter((f): f is RcFile => Boolean(f));
       onFilesSelected(rawFiles);
     }
   };
